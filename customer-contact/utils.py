@@ -131,6 +131,65 @@ def create_rag_chain(db_name):
 
     return rag_chain
 
+def create_employee_search_chain():
+    """
+    従業員情報検索用のRAG Chainを作成し、セッションステートに格納する
+    """
+    import csv
+    from langchain.schema import Document
+
+    docs_all = []
+    with open(ct.EMPLOYEE_FILE_PATH, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        headers = [h.strip() for h in reader.fieldnames or []]
+        for row in reader:
+            kv = []
+            for h in headers:
+                v = (row.get(h) or "").strip()
+                if v:
+                    kv.append(f"{h}={v}")
+            if kv:
+                doc = Document(
+                    page_content="; ".join(kv),
+                    metadata={"source": ct.EMPLOYEE_FILE_PATH, "doc_type": "employee_roster", "no_split": True}
+                )
+                docs_all.append(doc)
+
+    # 埋め込みモデルの用意
+    embeddings = OpenAIEmbeddings()
+
+    # チャンク分割用のオブジェクトを作成
+    text_splitter = CharacterTextSplitter(
+        chunk_size=ct.CHUNK_SIZE,
+        chunk_overlap=ct.CHUNK_OVERLAP,
+        separator="\n"
+    )
+
+    # チャンク分割を実施
+    no_split_docs = [d for d in docs_all if d.metadata.get("no_split")]
+    split_targets = [d for d in docs_all if not d.metadata.get("no_split")]
+
+    split_docs = text_splitter.split_documents(split_targets)
+    final_docs = no_split_docs + split_docs  # ← これを以降に使う
+    #print(final_docs)
+
+
+    # ベクターストアの作成
+    db = Chroma.from_documents(final_docs, embedding=embeddings)
+    # ベクターストアを検索するRetrieverの作成
+    retriever = db.as_retriever(search_kwargs={"k": ct.TOP_K})
+
+    # プロンプトの作成
+    question_answer_prompt = ChatPromptTemplate.from_messages([
+        ("system", ct.SYSTEM_PROMPT_EMPLOYEE_SEARCH),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ])
+    question_answer_chain = create_stuff_documents_chain(st.session_state.llm, question_answer_prompt)
+    rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+
+    return rag_chain
+
 
 def add_docs(folder_path, docs_all):
     """
@@ -207,6 +266,19 @@ def run_customer_doc_chain(param):
 
     return ai_msg["answer"]
 
+def run_employee_search_chain(param):
+    """
+    従業員情報データ参照に特化したTool設定用の関数
+
+    Args:
+        param: ユーザー入力値
+
+    Returns:
+        LLMからの回答
+    """
+    ai_msg = st.session_state.employee_search_chain.invoke({"input": param, "chat_history": st.session_state.chat_history})
+    st.session_state.chat_history.extend([HumanMessage(content=param), AIMessage(content=ai_msg["answer"])])
+    return ai_msg["answer"]
 
 def delete_old_conversation_log(result):
     """
@@ -281,7 +353,8 @@ def notice_slack(chat_message):
     agent_executor = initialize_agent(
         llm=st.session_state.llm,
         tools=tools,
-        agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION
+        agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+        handle_parsing_errors=True
     )
 
     # 担当者割り振りに使う用の「従業員情報」と「問い合わせ対応履歴」の読み込み
